@@ -1,0 +1,1063 @@
+#!/bin/bash
+
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+#
+# accessio - Primary synchroniser between uci rpcd and smb/ht/passwd
+#
+# Michael Hammes, 2022
+# Apache License, Version 2.0, January 2004
+#
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+
+
+
+# ###################################################################################
+#
+# USAGE
+#
+function dohelp() {
+	echo "Usage: access <hash/export/import/forceimport>"
+	return 0
+}
+
+
+# ###################################################################################
+#
+# RUNTIME VARIABLES, PARAMETERS AND CONSTANTS
+#
+parverbose=0 # Parameter
+
+cfgpidfile="/tmp/accessio.pid"
+cfgimporttrigger="/tmp/accessio.import"
+cfgexporttrigger="/tmp/accessio.export"
+
+cfgconfpath="/etc/config/access"
+cfgrpcdpath="/etc/config/rpcd"
+
+
+cfgtimefile="/etc/accessio.times"
+cfgknownusers="/etc/accessio.users"
+cfgknowngroups="/etc/accessio.groups"
+
+cfgnoshell="/bin/false" # Static
+cfgshell="/bin/ash" # UCI
+
+cfghashmethod="MD5" # UCI
+
+cfgsmbwrite=0 # UCI
+cfgsmbpassfile="/etc/smbpasswd" # UCI
+cfgsmbconffile="/etc/smbpasswd.conf" # Automatic
+
+cfghtwrite=0 # UCI
+cfghthashmethod="APR1" # UCI
+cfghtpassfile="/etc/htpasswd" # UCI
+
+cancommit=0 # Changes ready to commit
+
+cfgsyncexternal=0
+
+
+
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+#
+# SECTION HELPERS
+#
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+
+
+
+# ###################################################################################
+#
+# LOGGERS
+#
+function doverbose() {
+	#logger -t "$(basename "${0%.*}")($DEVNAME)[$$]" -- "$@"
+	if [ $parverbose -eq 1 ]; then echo "$(basename "${0%.*}")[$$]" -- "$@"; fi
+}
+
+function doerr() {
+	logger -st "$(basename "${0%.*}")($DEVNAME)[$$]" -- "$@"
+	if [ $parverbose -eq 1 ]; then echo "$(basename "${0%.*}")[$$]" -- "$@"; fi
+}
+
+
+# ###################################################################################
+#
+# INPUT STRING VALIDATION
+#
+function dovalidate() {
+	if [ "$1" == "user" ]; then
+		if [[ $2 =~ ^([[:print:]]+)$ ]]; then return 0; fi
+		doerr "Invalid user name."
+		
+	elif [ "$1" == "group" ]; then
+		if [[ $2 =~ ^([[:print:]]+)$ ]]; then return 0; fi
+		doerr "Invalid group name."
+
+	elif [ "$1" == "usergroups" ]; then
+		if [ "$2" == "" ] || [[ $2 =~ ^([[:print:]]+)$ ]]; then return 0; fi
+		doerr "Invalid group list."
+		
+	elif [ "$1" == "pass" ]; then
+		if [[ $2 =~ ^([[:print:]]+)$ ]]; then return 0; fi
+		doerr "Invalid password."
+
+	elif [ "$1" == "hash" ]; then
+		if [[ $2 =~ ^([[:print:]]+)$ ]]; then return 0; fi
+		doerr "Invalid hash entry."
+
+	elif [ "$1" == "echohash" ]; then
+		if [ "$2" == "" ] || [ "$2" == "echohash" ]; then return 0; fi
+		doerr "Invalid echo hash parameter."
+
+	elif [ "$1" == "bool" ]; then
+		if [ "$2" == "0" ] || [ "$2" == "1" ]; then return 0; fi
+		doerr "Invalid state."
+
+	else
+		doerr "Invalid type."
+		
+	fi
+	return 1
+}
+
+
+# ###################################################################################
+#
+# arraycontains array[@] ${find[0]}
+#
+function arraycontains() {
+	declare -a _arr=("${!1}")
+	for (( _arraycontains=0; _arraycontains<${#_arr[@]}; _arraycontains++ )); do
+		if [ "${_arr[$_arraycontains]}" == "$2" ]; then return 0; fi
+	done
+	return 1
+}
+
+
+
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+#
+# SECTION UCI HELPERS
+#
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+
+
+
+# ###################################################################################
+#
+#
+# 1: Section File
+# 2: Section Type
+# 3: Section Key Name
+# 4: Section Key Value
+#
+_ucicontains=-1
+_ucicontainscount=-1
+function ucicontains() {
+	local i=0; local s=""
+	while s=$(uci -q get "${1}.@${2}[$i].${3}" 2> /dev/null); do
+		if [ "$s" == "$4" ]; then _ucicontains=$i; _ucicontainscount=-1; return 0; fi
+		i=$((i+1))
+	done
+	_ucicontains=-1
+	_ucicontainscount=$i
+	return 1
+}
+
+
+# ###################################################################################
+#
+# UCI Configuration Getter (file access, section access)
+#
+# shell - Define shell for interactive users (default /bin/ash)
+# hashmethod=MD5/SHA512 - Set passwd hash method (default MD5)
+# smb=0/1 - Enable smbpasswd hash generation
+# smbpath - Specify local smbpasswd path
+# ht=0/1 - Enable htpasswd hash generation
+# htpath - Specify local htpasswd path
+# hthashmethod=APR1/SHA512 - Set htpasswd hash method (default MD5)
+#
+function doconfig() {
+	doverbose "Reading config..."
+
+	# Autocreate config
+	if ! uci -q show access > /dev/null || ! uci -q show access.access > /dev/null; then
+		doverbose "Creating access uci..."
+		echo "config section access" >> "$cfgucipath"
+		if [ $? -ne 0 ]; then doerr "Failed to create access uci."; return 1; fi
+	fi
+
+	# Verbose
+	local cfgverbose=$(uci -q get access.access.verbose)
+	if [ $? -eq 0 ] && [ "$cfgverbose" == "1" ]; then parverbose=1; fi
+
+	# Passwd User Shell
+	cfgshell=$(uci -q get access.access.shell)
+	if [ $? -ne 0 ]; then cfgshell="/bin/ash"; fi
+	doverbose "User shell: $cfgusershell"; doverbose "User noshell: $cfgnoshell"
+
+	# Passwd Hash Method
+	cfghashmethod=$(uci -q get access.access.hashmethod)
+	if [ $? -ne 0 ]; then cfghashmethod="MD5"; fi
+	if [ ! "$cfghashmethod" == "SHA512" ] && [ ! "$cfghashmethod" == "MD5" ]; then cfghashmethod="MD5"; fi
+	doverbose "Passwd hash method: $cfghashmethod"
+
+	# Enable SMB Passwords
+	cfgsmbwrite=$(uci -q get access.access.smb)
+	if [ $? -ne 0 ]; then cfgsmbwrite=0; fi
+	if ! which smbpasswd > /dev/null; then doerr "cfgsmbwrite requires smbpasswd"; cfgsmbwrite=0; fi
+
+	# Read SMB Config and Autocreate SMB Password and Config Files
+	if [ $cfgsmbwrite -eq 1 ]; then
+		cfgsmbpassfile=$(uci -q get access.access.smbpath)
+		if [ $? -ne 0 ]; then cfgsmbpassfile="/etc/smbpasswd"; fi
+		cfgsmbconffile="${cfgsmbpassfile}.conf"
+		
+		if [ ! -f $cfgsmbpassfile ]; then
+			touch $cfgsmbpassfile
+			if [ $? -ne 0 ]; then cfgsmbwrite=0; fi
+		fi
+
+		if [ ! -f $cfgsmbconffile ] || ! grep -e "smb passwd file = ${cfgsmbpassfile}"'$' $cfgsmbconffile > /dev/null; then
+			echo "passdb backend = smbpasswd" > $cfgsmbconffile
+			echo "smb passwd file = $cfgsmbpassfile" >> $cfgsmbconffile
+			if [ $? -ne 0 ]; then cfgsmbwrite=0; fi
+		fi
+
+		doverbose "Smbpasswd file: $cfgsmbpassfile"; doverbose "Smbpasswd conf file: $cfgsmbconffile"
+	fi
+
+	# Enable HT Passwords
+	cfghtwrite=$(uci -q get access.access.ht)
+	if [ $? -ne 0 ]; then cfghtwrite=0; fi
+	if ! which openssl > /dev/null; then doerr "cfghtwrite requires openssl"; cfghtwrite=0; fi
+
+	# HT Password Hash Method
+	cfghthashmethod=$(uci -q get access.access.hthashmethod)
+	if [ $? -ne 0 ]; then cfghthashmethod="APR1"; fi
+	if [ ! "$cfghthashmethod" == "SHA512" ] && [ ! "$cfghthashmethod" == "APR1" ]; then cfghthashmethod="APR1"; fi
+
+	# Read HT Config and Autocreate HT Password File
+	if [ $cfghtwrite -eq 1 ]; then
+		cfghtpassfile=$(uci -q get access.access.htpath)
+		if [ $? -ne 0 ]; then cfghtpassfile="/etc/htpasswd"; fi
+		
+		if [ ! -f $cfghtpassfile ]; then
+			touch $cfghtpassfile
+			if [ $? -ne 0 ]; then cfghtwrite=0; fi
+		fi
+
+		doverbose "Htpasswd file: $cfghtpassfile"
+		doverbose "Htpasswd hash method: $cfghthashmethod"
+	fi
+
+	# Synchronise external databases
+	cfgsyncexternal=$(uci -q get access.access.external)
+	if [ $? -ne 0 ]; then cfgsyncexternal=0; fi
+	doverbose "External database export: $cfgsyncexternal"
+
+	doverbose "Config read."
+	return 0
+}
+
+
+
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+#
+# SECTION EXPORT
+#
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+
+
+
+# ###################################################################################
+#
+#
+#
+function doexportdeletions() {
+
+	local cnt=0
+	
+	# Check known users file
+	doverbose "Exporting user deletions..."
+	if [ -f "$cfgknownusers" ]; then
+		local knownuser=""; while IFS= read -r knownuser; do
+			if ! ucicontains "rpcd" "login" "username" "$knownuser"; then
+				doverbose "Deleting user $knownuser."
+				userdel "$knownuser"
+				if [ $? -ne 0 ]; then doerr "Failed to delete user $knownuser from local passwd."; fi
+				if ucicontains "rpcd" "group" "name" "$knownuser"; then
+					cancommit=1; uci -q delete rpcd.@group[$_ucicontains] > /dev/null 2>&1
+					if [ $? -ne 0 ]; then doerr "Failed to reflect user $knownuser personal group deletion from uci."; fi
+				fi
+				if [ $cfgsmbwrite -eq 1 ]; then	sed -i "/^${knownuser}:.*/d" "${cfgsmbpassfile}"; fi
+				if [ $cfghtwrite -eq 1 ]; then sed -i "/^[#]*${knownuser}:.*/d" "${cfghtpassfile}"; fi
+				local syncindex=-1; local syncmode=""; while syncmode=$(uci -q get access.@sync[$((syncindex+1))].mode 2> /dev/null); do syncindex=$((syncindex+1))
+					local syncpath=$(uci -q get access.@sync[$((syncindex))].path 2> /dev/null)
+					if [ "$syncmode" == "passwd" ]; then
+						if [ -f "${syncpath}/passwd" ]; then sed -i "/^${knownuser}:.*/d" "${syncpath}/passwd"; dopushexportpost $syncindex; fi
+						if [ -f "${syncpath}/shadow" ]; then sed -i "/^${knownuser}:.*/d" "${syncpath}/shadow"; dopushexportpost $syncindex; fi
+						if [ -f "${syncpath}/group" ]; then sed -i "/^${knownuser}:.*/d" "${syncpath}/group"; dopushexportpost $syncindex; fi
+					elif [ "$syncmode" == "smbpasswd" ]; then
+						if [ -f "${syncpath}" ]; then sed -i "/^${knownuser}:.*/d" "${syncpath}"; dopushexportpost $syncindex; fi
+					elif [ "$syncmode" == "htpasswd" ]; then
+						if [ -f "${syncpath}" ]; then sed -i "/^[#]*${knownuser}:.*/d" "${syncpath}"; dopushexportpost $syncindex; fi
+					fi
+				done
+				cnt=$((cnt+1))
+			fi
+		done < "$cfgknownusers"
+		rm "$cfgknownusers"
+	fi
+
+	# Check known groups file
+	doverbose "Exporting group deletions..."
+	if [ -f "$cfgknowngroups" ]; then
+		local knowngroup=""; while IFS= read -r knowngroup; do
+			if ! ucicontains "rpcd" "group" "name" "$knowngroup"; then
+				doverbose "Deleting group $knowngroup."
+				groupdel "$knowngroup"
+				if [ $? -ne 0 ]; then doerr "Failed to delete group $knowngroup from local passwd."; fi
+				cnt=$((cnt+1))
+			fi
+		done < "$cfgknowngroups"
+		rm "$cfgknowngroups"
+	fi
+
+	doverbose "Deleted $cnt users and groups."
+	return 0
+}
+
+
+# ###################################################################################
+#
+#
+#
+function doexportgroups() {
+
+	doverbose "Exporting groups..."
+	if [ -f "$cfgknowngroups" ]; then rm "$cfgknowngroups"; fi
+	
+	# For each uci group
+	local groupindex=-1; local groupname=""; while groupname=$(uci -q get rpcd.@group[$groupindex].name 2> /dev/null); do groupindex=$((groupindex+1))
+
+		# That is hereby known
+		echo "$groupname" >> "$cfgknowngroups"
+
+		# With optional group id
+		local groupid=-1; if ! groupid=$(uci -q get "rpcd.@group[$groupindex].id" 2> /dev/null) || ! echo "$groupid" | grep -e "^[0-9]*$" > /dev/null; then groupid=-1; fi
+
+		# Check whether it exists among passwd groups and if not
+		if ! cat /etc/group | grep -e "${groupname}:" > /dev/null; then doverbose "Creating group $groupname"
+
+			# Create it preferably with its original group id
+			doverbose "Adding group $groupname."
+			if [ $groupid -eq -1 ] || ! groupadd -g $groupid "$groupname" > /dev/null 2>&1; then
+				if ! groupadd "$groupname" > /dev/null 2>&1; then doerr "Failed to create group $groupname. Aborting."; return 2; fi
+			fi
+
+			# And write back the (new) groupid
+			if ! groupid=$(cat /etc/group | grep -e "${groupname}:.*:[0-9]*:" | grep -o ":[0-9]*:" | grep -o "[0-9]*"); then doerr "Failed to create group $groupname."; fi
+			doverbose "Setting group $groupname gid to $groupid."
+			cancommit=1; uci -q set rpcd.@group[$groupindex].id="$groupid"
+
+		fi
+
+		# So that all uci groups are present within passwd groups for consecutive user export
+	done
+	
+	doverbose "Processed $groupindex groups."
+	return 0
+	
+}
+
+
+# ###################################################################################
+#
+#
+#
+function doexportusers() {
+
+	doverbose "Exporting uci users to system passwd..."
+	if [ -f "$cfgknownusers" ]; then rm "$cfgknownusers"; fi
+
+	# For each uci user addressed by userindex and username
+	local userindex=-1; local username=""; while username=$(uci -q get "rpcd.@login[$((userindex+1))].username" 2> /dev/null); do userindex=$((userindex+1));
+		#if [ $userindex -eq 4 ]; then return 0; fi
+
+		# That is hereby known
+		echo "$username" >> "$cfgknownusers"
+
+		# With given user id, enabled state and interactive state
+		local userid=-1; if ! userid=$(uci -q get "rpcd.@login[$userindex].userid" 2> /dev/null) || ! echo "$userid" | grep -e "^[0-9]*$" > /dev/null; then userid=-1; fi
+		local userenabled=0; if ! userenabled=$(uci -q get "rpcd.@login[$userindex].enabled" 2> /dev/null) || ! echo "$userenabled" | grep -e "^[0-1]$" > /dev/null; then userenabled=0; fi
+		local userinteractive=0; if ! userinteractive=$(uci -q get "rpcd.@login[$userindex].interactive" 2> /dev/null) || ! echo "$userinteractive" | grep -e "^[0-1]$" > /dev/null; then userinteractive=0; fi
+
+		# Accompanied by passwd hashes
+		local userpasswdhash=""; if ! userpasswdhash=$(uci -q get "rpcd.@login[$userindex].passwdhash" 2> /dev/null); then doerr "Failed to read uci user $username passwd hash. Skipping."; continue; fi
+		local usersmbpasswdhash=""; if ! usersmbpasswdhash=$(uci -q get "rpcd.@login[$userindex].smbpasswdhash" 2> /dev/null); then doverbose "Note: Unable to read uci user $username smbpasswd hash."; smbpasswdhash=""; fi
+		local userhtpasswdhash=""; if ! userhtpasswdhash=$(uci -q get "rpcd.@login[$userindex].htpasswdhash" 2> /dev/null); then doverbose "Note: Unable to read uci user $username htpasswd hash."; userhtpasswdhash=""; fi
+
+		# As well as group memberships (including own group)
+		local usergroupsraw=""; if [ ! "$username" == "nobody" ] && ! usergroupsraw=$(uci -q get "rpcd.@login[$userindex].groups" 2> /dev/null); then
+			usergroupsraw="$username"
+			cancommit=1; if ! uci -q set rpcd.@login[$userindex].groups="$usergroupsraw" 2> /dev/null; then doerr "Failed to read and correct uci user $username groups."; else doverbose "Note: Fixed invalid uci user $username groups."; fi
+		fi
+
+		# That need to be filtered all non-existent groups
+		local usergroupsoutput=""; local usergroups=(); IFS=',' read -r -a usergroups <<< "$usergroupsraw"
+		local i=0; for ((i=0; i<${#usergroups[@]}; i++)); do
+			if cat /etc/group | grep "^${usergroups[$i]}" > /dev/null 2>&1; then usergroupsoutput="${usergroupsoutput},${usergroups[$i]}"; fi
+		done; unset i
+		if [ "$usergroupsoutput" == "" ]; then usergroupsraw="$username"; else usergroupsraw="${usergroupsoutput:1}"; fi
+		local usergroups=(); IFS=',' read -r -a usergroups <<< "$usergroupsraw"
+		
+		# Check whether a corresponding system passwd line exists
+		if ! cat /etc/passwd | grep -e "^${username}:" > /dev/null; then doverbose "Creating user ${username}."
+
+			# Create it preferably with its original user id
+			if [ $userid -eq -1 ] || ! useradd -M -d /var/tmp -s "$cfgnoshell" -u $userid "$username" > /dev/null 2>&1; then
+				if ! useradd -M -d /var/tmp -s "$cfgnoshell" "$username" > /dev/null 2>&1; then doerr "Failed to create user $username."; continue; fi
+			fi
+
+			# And write back new userid
+			cancommit=1; if ! userid=$(cat /etc/passwd | grep -e "${username}:.*:[0-9]*:" | grep -o ":[0-9]*:" | grep -o "[0-9]*") || ! uci -q set rpcd.@login[$userindex].userid="$userid" 2> /dev/null; then doerr "Failed to write back new user $username id."; fi
+
+			# So that a passwd, shadow and groups line exists for each uci user
+		fi
+
+		# Read the corresponding system passwd line
+		local passwdarray=(); IFS=':' read -r -a passwdarray <<< $(cat /etc/passwd | grep -e "${username}:.*:[0-9]*:")
+		if [ ${#passwdarray[@]} -lt 7 ]; then doerr "Invalid passwd line for user ${username}."; continue; fi
+		# Name: 0, Id: 2, Gid: 3, Home: 5, Shell: 6
+
+		# [1/7] Synchronise user interactive
+		if [ $userinteractive -eq 0 ] && [ ! "${passwdarray[6]}" == "/bin/false" ]; then
+			if ! usermod -s "${cfgnoshell}" "$username" > /dev/null; then doerr "Failed to set user $username interactive value. Skipping."; continue; else doverbose "Updated user $username interactive to $userinteractive."; fi
+		elif [ $userinteractive -eq 1 ] && [ "${passwdarray[6]}" == "/bin/false" ]; then
+			if ! usermod -s "${cfgshell}" "$username" > /dev/null; then doerr "Failed to set user $username interactive value. Skipping."; continue; else doverbose "Updated user $username interactive to $userinteractive."; fi
+		fi
+
+		# Read the corresponding shadow line
+		local shadowenabled=1; local shadowline=""; if ! shadowline=$(cat /etc/shadow | grep -o "${username}:[^:]*:" | grep -o ":[^:]*:" | grep -o "[^:]*"); then doerr "Failed to read user $username shadow entry. Skipping."; continue; fi
+		if [ ! "$shadowline" == "" ] && [ "${shadowline:0:1}" == "!" ]; then shadowline="${shadowline:1}"; shadowenabled=0; fi
+
+		# [2/7] Synchronise user passwd
+		if [ ! "$shadowline" == "$userpasswdhash" ]; then
+			if ! echo "${username}:${userpasswdhash}" | chpasswd -e > /dev/null 2>&1; then doerr "Failed to set user $username passwd hash. Skipping."; continue; else doverbose "Updated user $username passwdhash."; fi
+		fi
+
+		# [3/7] Synchronise user enabled
+		if [ $userenabled -eq 0 ] && [ $shadowenabled -eq 1 ]; then
+			if ! passwd -l "$username" > /dev/null 2>&1; then doerr "Failed to disable user $username. Skipping."; continue; else doverbose "Updated user $username enabled to $userenabled."; fi				
+		elif [ $userenabled -eq 1 ] && [ $shadowenabled -eq 0 ]; then
+			if ! passwd -u "$username" > /dev/null 2>&1; then doerr "Failed to enable user $username. Skipping."; continue; else doverbose "Updated user $username enabled to $userenabled."; fi
+		fi
+
+		# Filter dummy users
+		if [ "$username" == "nobody" ]; then continue; fi
+	
+		# [4/7] Synchronise user groups
+		local localusergroupsraw=""; if ! localusergroupsraw=$(groups ${username} | sed -e 's/ /,/g'); then doerr "Failed to read user $username groups. Skipping."; continue; fi
+		local localusergroups=(); IFS=',' read -r -a localusergroups <<< "$localusergroupsraw"; unset localusergroupsraw
+		local c=${#localusergroups[@]}; local f=0; local i=0; for ((i=0; i<${#usergroups[@]}; i++)); do
+			f=0
+			local j=0; for ((j=0; j<${#localusergroups[@]}; j++)); do if [ "${localusergroups[$j]}" == "${usergroups[$i]}" ]; then f=1; break; fi; done
+			if [ $f -eq 0 ]; then break; fi
+			c=$((c-1))
+		done; unset f; unset i; unset j
+		if [ $c -ne 0 ]; then
+			if ! usermod -G "$usergroupsraw" "$username"; then doerr "Failed to set user $username groups. Skipping."; continue; else doverbose "Updated user $username groups to $usergroupsraw."; fi
+		fi; unset c; unset localusergroups			
+
+		# [5/7] Synchronise user smbpasswd entry
+		if [ $cfgsmbwrite -eq 1 ]; then
+
+			# Establish that a smbpasswd line exists if and only if a valid smbpasswdhash is set
+			if [ ! "$usersmbpasswdhash" == "" ]; then
+
+				# Find smbpasswd line or create one
+				local smbpasswdline=""; if ! smbpasswdline=$(cat $cfgsmbpassfile | grep "^${username}:"); then
+					if ! (echo "12345678"; echo "12345678") | smbpasswd -c $cfgsmbconffile -a -d "$username" > /dev/null 2>&1; then doerr "Failed to add user $username to smbpasswd."; else doverbose "Added user $username to smbpasswd."; fi
+					smbpasswdline=$(cat $cfgsmbpassfile | grep "^${username}:")
+				fi
+
+				# Check if it should be updated
+				local smbpasswdhash=$(echo $smbpasswdline | grep -o ":[A-F0-9NO PSWRX]*:\[" | grep -o "[A-F0-9NO PSWRX]*")
+				if [ ! "$smbpasswdhash" == "$usersmbpasswdhash" ]; then
+					if ! pdbedit -s "$cfgsmbconffile" --user="${username}" --set-nt-hash=${usersmbpasswdhash} > /dev/null 2>&1; then doerr "Failed to update user $username within smbpasswd."; else doverbose "Updated user $username within smbpasswd."; fi
+					smbpasswdline=$(cat $cfgsmbpassfile | grep "^${username}:")
+				fi
+
+				# Check if it should be enabled or disabled
+				if [ $userenabled -eq 1 ] && echo $smbpasswdline | grep -e "^${username}:.*\[.*D.*]:" > /dev/null; then
+					if ! smbpasswd -c $cfgsmbconffile -e "$username"; then doerr "Failed to enable user $username within smbpasswd."; else doverbose "Enabled user $username within smbpasswd."; fi
+				elif [ $userenabled -eq 0 ] && ! echo $smbpasswdline | grep -e "^${username}:.*\[.*D.*]:" > /dev/null; then
+					if ! smbpasswd -c $cfgsmbconffile -d "$username" > /dev/null 2>&1; then doerr "Failed to disable user $username within smbpasswd."; else doverbose "Disabled user $username within smbpasswd."; fi
+				fi				
+
+			else
+
+				# Delete smbpasswd line if found
+				if cat $cfgsmbpassfile | grep "^${username}:" > /dev/null; then
+					if ! smbpasswd -c $cfgsmbconffile -x "$username" > /dev/null 2>&1; then doerr "Failed to delete user $username from smbpasswd."; else doverbose "Deleted user $username from smbpasswd."; fi
+				fi
+			fi
+
+		fi
+
+		# [6/7] Synchronise user htpasswd entry
+		if [ $cfghtwrite -eq 1 ]; then
+
+			# Establish that a htpasswd line exists if and only if a valid htpasswdhash is set
+			if [ ! "$userhtpasswdhash" == "" ]; then
+				local htpasswdlineout=""; if [ $userenabled -eq 0 ]; then htpasswdlineout="#"; fi; htpasswdlineout="${htpasswdlineout}${username}:${userhtpasswdhash}"
+				local htpasswdline=""; if ! htpasswdline=$(cat $cfghtpassfile | grep "^[#]*${username}:") || [ ! "$htpasswdline" == "$htpasswdlineout" ]; then
+					if ! sed -i "/^[#]*${username}:.*/d" "${cfghtpassfile}" > /dev/null 2>&1 || ! echo "$htpasswdlineout" >> $cfghtpassfile; then doerr "Failed to update user $username within htpasswd."; else doverbose "Updated user $username within htpasswd."; fi
+				fi
+			else
+				if cat $cfghtpassfile | grep "^[#]*${username}:" > /dev/null > /dev/null; then
+					if ! sed -i "/^[#]*${username}:.*/d" "${cfghtpassfile}" > /dev/null 2>&1; then doerr "Failed to delete user $username from htpasswd."; else doverbose "Deleted user $username from htpasswd."; fi
+				fi
+			fi
+		fi
+
+		# [7/7] Synchronise external databases
+		if [ $cfgsyncexternal -eq 0 ]; then continue; fi
+		
+		# For each uci sync profile
+		local syncindex=-1; local syncmode=""; while syncmode=$(uci -q get access.@sync[$((syncindex+1))].mode 2> /dev/null); do syncindex=$((syncindex+1))
+
+			# With given output path and group filter
+			local syncpath=""; if ! syncpath=$(uci -q get access.@sync[$syncindex].path); then doerr "Failed to read sync $syncindex path. Skipping."; continue; fi
+			local syncgroup=""; if ! syncgroup=$(uci -q get access.@sync[$syncindex].group); then doerr "Failed to read sync $syncindex group. Skipping."; continue; fi
+
+			# As well as mode differentiating between passwd, smbasswd and htpasswd databases
+			if [ "$syncmode" == "passwd" ]; then
+
+				# Remove user if group filter set and unmatched
+				if [ ! "$syncgroup" == "" ] && [[ ! ,${usergroupsraw}, == *,${syncgroup},* ]]; then
+					if [ -f "${syncpath}/passwd" ] && cat "${syncpath}/passwd" | grep -e "^${username}:" > /dev/null; then sed -i "/^${username}:.*/d" "${syncpath}/passwd" > /dev/null 2>&1; dopushexportpost $syncindex; fi
+					if [ -f "${syncpath}/shadow" ] && cat "${syncpath}/shadow" | grep -e "^${username}:" > /dev/null; then sed -i "/^${username}:.*/d" "${syncpath}/shadow" > /dev/null 2>&1; dopushexportpost $syncindex; fi
+				else
+					# Consider home and shell overrides for passwd databases
+					local synchome=""; if ! synchome=$(uci -q get access.@sync[$syncindex].home); then synchome=""; fi
+					local syncshell=""; if ! syncshell=$(uci -q get access.@sync[$syncindex].shell); then syncshell=""; fi
+
+					# Construct passwd entry
+					local syncout="${username}:x:${userid}:$(id -g $username):"
+					if [ "$synchome" == "" ]; then syncout="${syncout}:${passwdarray[5]}"; else syncout="${syncout}:${synchome}"; fi
+					if [ $userinteractive -eq 0 ]; then	syncout="${syncout}:/bin/false"; else
+						if [ ! "$syncshell" == "" ]; then syncout="${syncout}:${syncshell}"; else syncout="${syncout}:${cfgshell}"; fi
+					fi
+
+					# Export passwd entry
+					if [ ! -f "${syncpath}/passwd" ]; then touch "${syncpath}/passwd"; fi
+					local syncin=""; if syncin=$(cat "${syncpath}/passwd" | grep -e "^${username}:") && [ ! "$syncin" == "$syncout" ]; then sed -i "/^${username}:.*/d" "${syncpath}/passwd" > /dev/null 2>&1; fi
+					if [ ! "$syncin" == "$syncout" ]; then echo "$syncout" >> "${syncpath}/passwd"; dopushexportpost $syncindex; fi
+
+					# Compare shadow entry
+					if [ ! -f "${syncpath}/shadow" ]; then touch "${syncpath}/shadow"; fi
+					syncout=$(cat /etc/shadow | grep -e "^${username}:")
+					if syncin=$(cat ${syncpath}/shadow | grep -e "^${username}:") && [ ! "$syncin" == "$syncout" ]; then sed -i "/^${username}:.*/d" "${syncpath}/shadow" > /dev/null 2>&1; fi
+					if [ ! "$syncin" == "$syncout" ]; then echo "$syncout" >> "${syncpath}/shadow"; dopushexportpost $syncindex; fi
+				fi
+
+			elif [ $cfgsmbwrite -eq 1 ] && [ "$syncmode" == "smbpasswd" ]; then
+
+				# Remove user if group filter set and unmatched
+				if [ ! "$syncgroup" == "" ] && [[ ! ,${usergroupsraw}, == *,${syncgroup},* ]]; then
+					if [ -f "${syncpath}" ] && cat "${syncpath}" | grep -e "^${username}:" > /dev/null; then sed -i "/^${username}:.*/d" "${syncpath}" > /dev/null 2>&1; dopushexportpost $syncindex; fi
+				else
+					# Add or update smbpasswd entry
+					if [ ! -f "${syncpath}" ]; then touch "${syncpath}"; fi
+					syncout=$(cat $cfgsmbpassfile | grep -e "^${username}:")
+					if syncin=$(cat ${syncpath} | grep -e "^${username}:") && [ ! "$syncin" == "$syncout" ]; then sed -i "/^${username}:.*/d" "${syncpath}" > /dev/null 2>&1; fi
+					if [ ! "$syncin" == "$syncout" ]; then echo "$syncout" >> "${syncpath}"; dopushexportpost $syncindex; fi
+				fi
+
+			elif [ $cfghtwrite -eq 1 ] && [ "$syncmode" == "htpasswd" ]; then
+
+				# Remove user if group filter set and unmatched
+				if [ ! "$syncgroup" == "" ] && [[ ! ,${usergroupsraw}, == *,${syncgroup},* ]]; then
+					if [ -f "${syncpath}" ] && cat "${syncpath}" | grep -e "^[#]*${username}:" > /dev/null; then sed -i "/^[#]*${username}:.*/d" "${syncpath}" > /dev/null 2>&1; dopushexportpost $syncindex; fi
+				else
+					# Add or update htpasswd entry
+					if [ ! -f "${syncpath}" ]; then touch "${syncpath}"; fi
+					syncout=$(cat $cfghtpassfile | grep -e "^[#]*${username}:")
+					if syncin=$(cat ${syncpath} | grep -e "^[#]*${username}:") && [ ! "$syncin" == "$syncout" ]; then sed -i "/^[#]*${username}:.*/d" "${syncpath}" > /dev/null 2>&1; fi
+					if [ ! "$syncin" == "$syncout" ]; then echo "$syncout" >> "${syncpath}"; dopushexportpost $syncindex; fi
+				fi
+				
+			fi
+
+			# So that external system, smb and ht passwd databases represent all uci users (eligible through their respective group membership)
+		done
+
+		# So that local system, smb and ht passwd represent all uci users and groups
+	done
+
+	userindex=$((userindex+1))
+	doverbose "Processed $userindex users."
+	return 0
+}
+	
+
+# ###################################################################################
+#
+#
+#
+function doexportsyncgroups() {
+
+	if [ $cfgsyncexternal -eq 0 ]; then return 0; fi
+	doverbose "Synchronising external groups..."
+	
+	# For each passwd group entry
+	local groupindex=0; local groupinput=""; while IFS= read -r groupinput; do groupmembers=(); groupoutput=""
+
+		# With valid column count
+		local grouparray=(); IFS=':' read -r -a grouparray <<< $groupinput
+		if [ ${#grouparray[@]} -lt 3 ]; then doerr "Failed to read group entry $cnt ."; continue; fi
+
+		# And given members
+		local groupmembers=(); if [ ! "${grouparray[3]}" == "" ]; then IFS=',' read -r -a groupmembers <<< ${grouparray[3]}; fi
+
+		# Find passwd syncs
+		local groupsyncindex=-1; local groupsyncmode=""; while groupsyncmode=$(uci -q get "access.@sync[$((groupsyncindex+1))].mode" 2> /dev/null); do groupsyncindex=$((groupsyncindex+1))
+			if [ "$groupsyncmode" == "passwd" ]; then
+				# With valid sync path
+				local groupsyncpath=""; if ! groupsyncpath=$(uci -q get access.@sync[$groupsyncindex].path); then doerr "Failed to read sync $scnt path. Skipping."; continue; fi
+				if [ ! -f "${groupsyncpath}/group" ]; then touch "${groupsyncpath}/group"; fi
+
+				# That contain these members
+				local groupuserindex=0; local groupoutput=""; for ((groupuserindex=0; groupuserindex<${#groupmembers[@]}; groupuserindex++)); do
+					if cat "${groupsyncpath}/passwd" | grep -e "^${groupmembers[$groupuserindex]}:" > /dev/null; then groupoutput="${groupoutput},${groupmembers[$groupuserindex]}"; fi
+				done
+				if [ ! "$groupoutput" == "" ] && [ "${groupoutput:0:1}" == "," ]; then groupoutput="${groupoutput:1}"; fi
+
+				# In order to construct reference group entries and compare them to the actual entries
+				if  [ ! "$groupoutput" == "" ]; then
+					groupoutput="${grouparray[0]}:${grouparray[1]}:${grouparray[2]}:${groupoutput}"
+					doverbose "$groupoutput"
+					if groupinput=$(cat "${groupsyncpath}/group" | grep -e "^${grouparray[0]}:") && [ ! "$groupinput" == "$groupoutput" ]; then sed -i "/^${grouparray[0]}:.*/d" "${groupsyncpath}/group" > /dev/null 2>&1; fi
+					if [ ! "$groupinput" == "$groupoutput" ]; then echo "$groupoutput" >> "${groupsyncpath}/group"; dopushexportpost $groupsyncindex; fi
+				else
+					if cat "${groupsyncpath}/group" | grep -e "^${grouparray[0]}:" > /dev/null; then sed -i "/^${grouparray[0]}:.*/d" "${groupsyncpath}/group" > /dev/null 2>&1; fi
+				fi
+			fi
+		done
+
+		# So that external passwd database groups represent all uci groups of all eligible users
+	done < "/etc/group"
+
+	groupindex=$((groupindex+1))
+	doverbose "Processed $groupindex groups."
+	return 0
+}
+
+
+# ###################################################################################
+#
+#
+#
+exportposts=()
+function dopushexportpost() {
+	local i=0; for ((i=0; i<${#exportposts[@]}; i++)); do if [ "${exportposts[$i]}" == "$1" ]; then return 1; fi; done
+	exportposts+=("$1")
+	return 0
+}
+
+
+# ###################################################################################
+#
+#
+#
+function doexportpost() {
+
+	if [ $cfgsyncexternal -eq 0 ]; then return 0; fi
+	doverbose "Executing external post-update commands..."
+
+	local syncname=""
+	local syncpost=""
+	local cnt=0; local i=0; for ((i=0; i<${#exportposts[@]}; i++)); do
+		if ! syncname=$(uci -q get access.@sync[${exportposts[$i]}].name); then syncname="${exportposts[$i]}"; fi
+		if ! syncpost=$(uci -q get access.@sync[${exportposts[$i]}].postexec); then continue; fi
+		if [ ! "$syncpost" == "" ] && ! ${syncpost} > /dev/null 2>&1; then doerr "Failed to execute sync $syncname post update command."; fi
+		doverbose "Successfully executed sync $syncname post update command."
+		cnt=$((cnt+1))
+	done
+	
+	doverbose "Processed $cnt post-update commands."
+	return 0
+}
+
+
+
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+#
+# SECTION IMPORT
+#
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+
+
+
+# ###################################################################################
+#
+#
+#
+function doskipimport() {
+	local cachetime=""
+	if [ -f "$cfgtimefile" ]; then cachetime=$(cat "$cfgtimefile"); fi
+	local curtime=$(stat -c %Y /etc/passwd)":"$(stat -c %Y /etc/shadow)":"$(stat -c %Y /etc/group)
+	doverbose "Import cache time is ${cachetime}, current time is ${curtime}."
+	if [ ! "$cachetime" == "$curtime" ]; then doverbose "Import required."; return 1; fi
+	return 0
+}
+
+
+# ###################################################################################
+#
+#
+#
+function dosetimporttime() {
+	local curtime=$(stat -c %Y /etc/passwd)":"$(stat -c %Y /etc/shadow)":"$(stat -c %Y /etc/group)
+	echo "$curtime" > "$cfgtimefile"
+}
+
+
+# ###################################################################################
+#
+#
+#
+function doimportgroups() {
+
+	doverbose "Importing groups from system to uci..."
+
+	# For each system group
+	local groupindex=-1; local inline=""; while IFS= read -r inline; do groupindex=$((groupindex+1))
+
+		# With name (0), id (2) and members (3)
+		local group=(); IFS=':' read -r -a group <<< $inline
+		if [ ${#group[@]} -lt 3 ]; then doerr "Invalid group line $groupindex (${#group[@]}). Skipping."; continue; fi
+		doverbose "Processing group ${group[0]}"
+
+		# Try to find a corresponding uci entry
+		local ucigroupindex=-1; if ucicontains "rpcd" "group" "name" "${group[0]}"; then ucigroupindex=$_ucicontains; else ucigroupindex=$_ucicontainscount
+
+			# And otherwise create one
+			doverbose "Creating group ${group[0]}"
+			cancommit=1
+			local id=$(uci -q add rpcd group); if [ $? -ne 0 ]; then doerr "Failed to create uci entry for group ${group[0]}. Reverting all."; uci revert rpcd; return 2; fi
+			uci -q set "rpcd.${id}.name=${group[0]}"; if [ $? -ne 0 ]; then doerr "Failed to create uci entry for group ${group[0]}. Reverting all."; uci revert rpcd; return 2; fi
+
+		fi
+
+		# Update uci group id if required
+		if ! inline=$(uci -q get rpcd.@group[$groupindex].id) || [ ! "$inline" == "${group[2]}" ]; then doverbose "Setting user ${group[0]} uid to ${group[2]}."
+			doverbose "Updating group ${group[0]} id to ${group[2]}."
+			cancommit=1
+			uci -q set rpcd.@group[$groupindex].id="${group[2]}"; if [ $? -ne 0 ]; then doerr "Failed to set user ${group[0]} uci uid to ${group[2]}. Reverting all."; uci revert rpcd; return 2; fi
+		fi
+
+		# So that a uci group exists for each system group
+	done < /etc/group
+
+	doverbose "Processed $((groupindex+1)) groups."
+	return 0
+}
+
+
+# ###################################################################################
+#
+#
+# Note: No smbpasswdhash, htpasswdhash or deletion import!
+#
+function doimportusers() {
+
+	doverbose "Importing users from system to uci..."
+
+	# For each system user
+	local usercnt=-1; local inline=""; while IFS= read -r inline; do usercnt=$((usercnt+1))
+
+		# With name (0), id (2), gid (3), home (5) and shell (6)
+		local user=(); IFS=':' read -r -a user <<< $inline
+		if [ ${#user[@]} -lt 7 ]; then doerr "Invalid passwd line $userindex. Skipping."; continue; fi
+		doverbose "Processing user ${user[0]}"
+
+		# Allowing to derive interactive state
+		local userinteractive=0; if [ ! "${user[6]}" == "$cfgnoshell" ]; then userinteractive=1; fi
+
+		# And shadow passwd hash
+		local userpasswdhash=$(cat /etc/shadow | grep -e "^${user[0]}:" | grep -o ":.*" | grep -o "[^:].*" | grep -o "^[^:]*")
+		if [ $? -ne 0 ]; then doerr "Invalid shadow line for user ${user[0]}. Skipping."; continue; fi
+
+		# Allowing to derive enabled state
+		local userenabled=1; if [ "${userpasswdhash:0:1}" == "!" ]; then userenabled=0; userpasswdhash="${userpasswdhash:1}"; fi
+
+		# And to prevent empty passwords
+		if [ "${userpasswdhash}" == "" ] || [ ! "${userpasswdhash:0:1}" == '$' ]; then userpasswdhash="*"; fi
+
+		# As well as group memberships
+		local usergroups=$(groups ${user[0]} | sed -e 's/ /,/g')
+		if [ $? -ne 0 ]; then doerr "Unable to determine groups for user ${user[0]}. Skipping."; continue; fi
+		
+
+		# Do try to find a corresponding uci entry
+		local userindex=-1; if ucicontains "rpcd" "login" "username" "${user[0]}"; then userindex=$_ucicontains; else userindex=$_ucicontainscount; doverbose "Adding user ${user[0]}"
+
+			# And otherwise create one
+			doverbose "Creating user ${user[0]}."
+			cancommit=1; local id=$(uci -q add rpcd login); if [ $? -ne 0 ]; then doerr "Failed to create uci entry for user ${user[0]}. Reverting all."; uci revert rpcd; return 2; fi
+			uci -q set "rpcd.${id}.username=${user[0]}"; if [ $? -ne 0 ]; then doerr "Failed to create uci entry for user ${user[0]}. Reverting all."; uci revert rpcd; return 2; fi
+		fi
+
+
+		# Update uci uid if required
+		if ! inline=$(uci -q get rpcd.@login[$userindex].userid) || [ ! "$inline" == "${user[2]}" ]; then doverbose "Setting user ${user[0]} uid to ${user[2]}."
+			cancommit=1; uci -q set rpcd.@login[$userindex].userid="${user[2]}"
+			if [ $? -ne 0 ]; then doerr "Failed to set user ${user[0]} uci uid to ${user[2]}"; uci revert rpcd; return 2; fi
+		fi
+
+		# Update uci passwdhash if required
+		if ! inline=$(uci -q get rpcd.@login[$userindex].passwdhash) || [ ! "$inline" == "${userpasswdhash}" ]; then doverbose "Updating user ${user[0]} passwdhash."
+			cancommit=1; uci -q set rpcd.@login[$userindex].passwdhash="${userpasswdhash}"
+			if [ $? -ne 0 ]; then doerr "Failed to set user ${user[0]} uci passwdhash."; uci revert rpcd; return 2; fi
+		fi
+
+		# Update uci password field if required
+		if ! inline=$(uci -q get rpcd.@login[$userindex].password) || [ ! "$inline" == '$'"p"'$'"${user[0]}" ]; then doverbose "Setting user ${user[0]} password field to "'$'"p"'$'"${user[0]}."
+			cancommit=1; uci -q set rpcd.@login[$userindex].password='$'"p"'$'"${user[0]}"
+			if [ $? -ne 0 ]; then doerr "Failed to set user ${user[0]} uci password field to "'$'"p"'$'"${user[0]}"; uci revert rpcd; return 2; fi
+		fi		
+
+		# Update uci enabled if required
+		if ! inline=$(uci -q get rpcd.@login[$userindex].enabled) || [ ! "$inline" == "$userenabled" ]; then doverbose "Setting user ${user[0]} enabled to $userenabled."
+			cancommit=1; uci -q set rpcd.@login[$userindex].enabled="$userenabled"
+			if [ $? -ne 0 ]; then doerr "Failed to set user ${user[0]} uci state to $userenabled"; uci revert rpcd; return 2; fi				
+		fi
+
+		# Update uci interactive if required
+		if ! inline=$(uci -q get rpcd.@login[$userindex].interactive) || [ ! "$inline" == "$userinteractive" ]; then doverbose "Setting user ${user[0]} interactive to $userinteractive"
+			cancommit=1; uci -q set rpcd.@login[$userindex].interactive="$userinteractive"
+			if [ $? -ne 0 ]; then doerr "Failed to set user ${user[0]} uci shell state to $userinteractive"; uci revert rpcd; return 2; fi
+		fi
+		#
+		# Update uci groups if required
+		if ! inline=$(uci -q get rpcd.@login[$userindex].groups) || [ ! "$inline" == "$usergroups" ]; then doverbose "Setting user ${user[0]} groups to $usergroups"
+			cancommit=1; uci -q set rpcd.@login[$userindex].groups="$usergroups"
+			if [ $? -ne 0 ]; then doerr "Failed to set user ${user[0]} uci groups to $usergroups"; uci revert rpcd; return 2; fi
+		fi
+		
+	done < /etc/passwd
+
+	usercnt=$((usercnt+1))
+	doverbose "Processed $usercnt users."
+	return 0
+
+}
+
+
+
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+#
+# SECTION HASH
+#
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+
+
+
+function dohash() {
+
+	res=0
+	pres=""
+	if [ "$cfghashmethod" == "CRYPT" ]; then
+		pres=$(/usr/bin/openssl passwd -crypt "$1"); res=$?
+	elif [ "$cfghashmethod" == "MD5" ]; then
+		pres=$(/usr/bin/openssl passwd -1 "$1"); res=$?
+	elif [ "$cfghashmethod" == "SHA256" ]; then
+		pres=$(/usr/bin/openssl passwd -5 "$1"); res=$?
+	elif [ "$cfghashmethod" == "SHA512" ]; then
+		pres=$(/usr/bin/openssl passwd -6 "$1"); res=$?
+	fi
+	if [ $res -ne 0 ]; then doerr "Failed to generate passwd hash."; return 2; fi
+
+	sres=""
+	if [ $cfgsmbwrite -eq 1 ]; then
+		sres=$(printf '%s' "$1" | /usr/bin/iconv -t UTF-16LE | /usr/bin/openssl md4 | /bin/sed 's/^.* //' | /usr/bin/tr [a-z] [A-Z])
+		if [ $? -ne 0 ]; then doerr "Failed to generate smbpasswd hash."; return 2; fi
+	fi
+
+	htres=""
+	if [ $cfghtwrite -eq 1 ]; then
+		if [ "$cfghthashmethod" == "APR1" ]; then
+			htres=$(/usr/bin/openssl passwd -apr1 "$1"); res=$?
+		elif [ "$cfghthashmethod" == "MD5" ]; then
+			htres=$(/usr/bin/openssl passwd -1 "$1"); res=$?
+		elif [ "$cfghthashmethod" == "SHA256" ]; then
+			pres=$(/usr/bin/openssl passwd -5 "$1"); res=$?
+		elif [ "$cfghthashmethod" == "SHA512" ]; then
+			pres=$(/usr/bin/openssl passwd -6 "$1"); res=$?
+		fi
+	fi
+	if [ $res -ne 0 ]; then doerr "Failed to generate htpasswd hash."; return 2; fi
+
+	echo "passwdhash=${pres}"
+	echo "smbpasswdhash=${sres}"
+	echo "htpasswdhash=${htres}"
+
+	return 0
+
+}
+
+
+
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+#
+# SECTION MAIN HELPERS
+#
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+
+
+
+function doimport() {
+	if [ "$1" == "import" ] && doskipimport; then doverbose "Skipping import: Nothing to update."; return 0; fi
+	doimportgroups; if [ $? -ne 0 ]; then return 2; fi
+	doimportusers; if [ $? -ne 0 ]; then return 3; fi
+	dosetimporttime
+	if [ $cancommit -eq 1 ] && ! uci -q commit rpcd > /dev/null 2>&1; then return 5; fi
+	cancommit=0
+	return 0
+}
+
+function doexport() {
+	doexportdeletions; if [ $? -ne 0 ]; then return 2; fi
+	doexportgroups; if [ $? -ne 0 ]; then return 3; fi
+	doexportusers; if [ $? -ne 0 ]; then return 4; fi
+	doexportsyncgroups; if [ $? -ne 0 ]; then return 5; fi
+	doexportpost; if [ $? -ne 0 ]; then return 6; fi
+	if [ $cancommit -eq 1 ] && ! uci -q commit rpcd > /dev/null 2>&1; then return 7; fi
+	cancommit=0
+	return 0
+}
+
+function dotelldaemon() {
+	local pid=""
+	if [ -f "$cfgpidfile" ] && pid=$(cat "$cfgpidfile") && [ -d "/proc/${pid}" ]; then
+		if [ "$1" == "export" ] && [ -f "$cfgexporttrigger" ]; then rm "$cfgexporttrigger"
+		elif [ "$1" == "import" ] && [ -f "$cfgimporttrigger" ]; then rm "$cfgimporttrigger"
+		fi
+		return 0
+	fi
+	return 1
+}
+
+
+
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+#
+# SECTION MAIN
+#
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################
+
+
+
+doconfig
+
+if [ "$1" == "import" ] || [ "$1" == "forceimport" ]; then
+	if dotelldaemon "import"; then exit 0; fi
+	
+	if [ "$2" == "verbose" ]; then parverbose=1; fi
+	doimport
+	exit $?
+	
+elif [ "$1" == "export" ]; then
+	if dotelldaemon "export"; then exit 0; fi
+
+	if [ "$2" == "verbose" ]; then parverbose=1; fi
+	doexport
+	exit $?
+
+elif [ "$1" == "hash" ]; then
+	if [ "$2" == "" ] || ! dovalidate "pass" "$2"; then exit 1; fi
+	if [ "$3" == "verbose" ]; then parverbose=1; fi
+	dohash "$2"
+	exit $?
+
+elif [ "$1" == "daemon" ]; then
+	if [ "$2" == "verbose" ]; then parverbose=1; fi
+
+	# Create pid file
+	echo "$$" > "$cfgpidfile"
+
+	# Perform post-install import and export if necessary
+	if [ ! -f "$cfgtimefile" ]; then
+		doverbose "Performing initial import..."
+		doimport
+		doverbose "Performing initial export..."
+		doexport
+		doverbose "Initialisation completed."
+	fi
+
+	# Monitor local passwd, shadow, group as well as uci rpcd, access and trigger files for changes
+	doverbose "Monitoring with pid $$"
+	while [ 1 -eq 1 ]; do
+
+		touch "$cfgimporttrigger"
+		touch "$cfgexporttrigger"
+		
+		monres=$(inotifywait -q --format "%w" -e modify,close_write /etc/passwd /etc/shadow /etc/group $cfgrpcdpath $cfgconfpath $cfgimporttrigger $cfgexporttrigger 2> /dev/null)
+		doverbose "Monitor result: $monres"
+		if [ ! -f "$cfgexporttrigger" ] || [ "$monres" == "$cfgrpcdpath" ] || [ "$monres" == "$cfgconfpath" ]; then
+			doexport
+		else
+			doimport
+		fi
+		sleep 1
+
+	done
+
+else
+	dohelp
+	exit 1
+
+fi
+
+exit 0
+
+
+# ###################################################################################
+# ###################################################################################
+# ###################################################################################

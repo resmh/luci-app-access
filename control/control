@@ -1,0 +1,14 @@
+Package: luci-app-access
+Depends: libc, luci-base, iconv, coreutils-stat, inotifywait, shadow-useradd, shadow-chpasswd, shadow-passwd, shadow-usermod, shadow-userdel, shadow-groups, shadow-groupadd, shadow-groupmod, shadow-groupdel, openssl-util
+Source: feeds/resmh/luci-app-access
+SourceName: luci-app-access
+Section: luci
+Maintainer: Michael Hammes
+Architecture: all
+Description: Graphical User and Group management for system as well as external passwd, smbpasswd and htpasswd databases.
+Installed-Size: 125500
+Filename: luci-app-access.ipk
+Version: 0.1.0
+SourceDateEpoch: 1647188422
+Size: 4301
+SHA256sum: ac6c02fc4e791cceacb2cbc1cbe61d6ebe0d8313e97d478c6293705b3bd2e3a4

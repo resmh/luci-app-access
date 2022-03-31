@@ -1,0 +1,42 @@
+{
+	"admin/access": {
+		"title": "Access",
+		"index": 4
+	},
+	"admin/access/accessusers": {
+		"title": "Users",
+		"order": 0,
+		"action": {
+			"type": "view",
+			"path": "system/accessusers"
+		},
+		"depends": {
+			"acl": [ "luci-app-access" ],
+			"uci": { "rpcd": true }
+		}
+	},
+	"admin/access/accessgroups": {
+		"title": "Groups",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "system/accessgroups"
+		},
+		"depends": {
+			"acl": [ "luci-app-access" ],
+			"uci": { "rpcd": true }
+		}
+	},
+	"admin/access/access": {
+		"title": "Synchronisation",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "system/access"
+		},
+		"depends": {
+			"acl": [ "luci-app-access" ],
+			"uci": { "rpcd": true }
+		}
+	}
+}
