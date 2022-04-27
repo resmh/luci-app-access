@@ -85,6 +85,7 @@ return view.extend({
 			o.value('passwd', 'Linux passwd');
 			o.value('smbpasswd', 'Samba passwd');
 			o.value('htpasswd', 'Hypertext passwd');
+			o.value('htpasswdgrp', 'Hypertext passwd with groups');
 			o.default = 'passwd';
 
 			o = s.option(form.Value, 'path', _('Export Path'));

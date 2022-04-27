@@ -593,7 +593,7 @@ function doexportusers() {
 					if [ ! "$syncin" == "$syncout" ]; then echo "$syncout" >> "${syncpath}"; dopushexportpost $syncindex; fi
 				fi
 
-			elif [ $cfghtwrite -eq 1 ] && [ "$syncmode" == "htpasswd" ]; then
+			elif [ $cfghtwrite -eq 1 ] && ([ "$syncmode" == "htpasswd" ] || [ "$syncmode" == "htpasswdgrp" ]); then
 
 				# Remove user if group filter set and unmatched
 				if [ ! "$syncgroup" == "" ] && [[ ! ,${usergroupsraw}, == *,${syncgroup},* ]]; then
@@ -602,6 +602,7 @@ function doexportusers() {
 					# Add or update htpasswd entry
 					if [ ! -f "${syncpath}" ]; then touch "${syncpath}"; fi
 					syncout=$(cat $cfghtpassfile | grep -e "^[#]*${username}:")
+					if [ "$syncmode" == "htpasswdgrp" ]; then syncout="${syncout}:${usergroupsraw}"; fi
 					if syncin=$(cat ${syncpath} | grep -e "^[#]*${username}:") && [ ! "$syncin" == "$syncout" ]; then sed -i "/^[#]*${username}:.*/d" "${syncpath}" > /dev/null 2>&1; fi
 					if [ ! "$syncin" == "$syncout" ]; then echo "$syncout" >> "${syncpath}"; dopushexportpost $syncindex; fi
 				fi
