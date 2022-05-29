@@ -1,7 +1,7 @@
 {
 	"admin/access": {
 		"title": "Access",
-		"index": 4
+		"order": 31
 	},
 	"admin/access/accessusers": {
 		"title": "Users",
