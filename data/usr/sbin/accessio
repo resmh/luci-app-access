@@ -196,7 +196,7 @@ function doconfig() {
 	# Autocreate config
 	if ! uci -q show access > /dev/null || ! uci -q show access.access > /dev/null; then
 		doverbose "Creating access uci..."
-		echo "config section access" >> "$cfgucipath"
+		echo "config section access" >> "$cfgconfpath"
 		if [ $? -ne 0 ]; then doerr "Failed to create access uci."; return 1; fi
 	fi
 

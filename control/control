@@ -1,5 +1,5 @@
 Package: luci-app-access
-Depends: libc, luci-base, iconv, coreutils-stat, inotifywait, shadow-useradd, shadow-chpasswd, shadow-passwd, shadow-usermod, shadow-userdel, shadow-groups, shadow-groupadd, shadow-groupmod, shadow-groupdel, openssl-util
+Depends: libc, luci-base, bash, iconv, coreutils-stat, inotifywait, shadow-useradd, shadow-chpasswd, shadow-passwd, shadow-usermod, shadow-userdel, shadow-groups, shadow-groupadd, shadow-groupmod, shadow-groupdel, openssl-util
 Source: feeds/resmh/luci-app-access
 SourceName: luci-app-access
 Section: luci
