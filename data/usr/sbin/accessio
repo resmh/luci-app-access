@@ -1041,6 +1041,9 @@ elif [ "$1" == "daemon" ]; then
 		
 		monres=$(inotifywait -q --format "%w" -e modify,close_write /etc/passwd /etc/shadow /etc/group $cfgrpcdpath $cfgconfpath $cfgimporttrigger $cfgexporttrigger 2> /dev/null)
 		doverbose "Monitor result: $monres"
+
+		doconfig
+		
 		if [ ! -f "$cfgexporttrigger" ] || [ "$monres" == "$cfgrpcdpath" ] || [ "$monres" == "$cfgconfpath" ]; then
 			doexport
 		else
