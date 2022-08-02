@@ -53,8 +53,10 @@ cfgsmbpassfile="/etc/smbpasswd" # UCI
 cfgsmbconffile="/etc/smbpasswd.conf" # Automatic
 
 cfghtwrite=0 # UCI
+cfghtgwrite=0 # UCI
 cfghthashmethod="APR1" # UCI
-cfghtpassfile="/etc/htpasswd" # UCI
+cfghtpassfile="/etc/htpasswd" # X UCI
+cfghtgroupfile="/etc/htgroup.map" # X UCI
 
 cancommit=0 # Changes ready to commit
 
@@ -245,6 +247,12 @@ function doconfig() {
 	if [ $? -ne 0 ]; then cfghtwrite=0; fi
 	if ! which openssl > /dev/null; then doerr "cfghtwrite requires openssl"; cfghtwrite=0; fi
 
+	# Enable HT Group Map
+	if [ $cfghtwrite -eq 1 ]; then
+		cfghtgwrite=$(uci -q get access.access.htg)
+		if [ $? -ne 0 ]; then cfghtgwrite=0; fi
+	fi
+
 	# HT Password Hash Method
 	cfghthashmethod=$(uci -q get access.access.hthashmethod)
 	if [ $? -ne 0 ]; then cfghthashmethod="APR1"; fi
@@ -260,7 +268,18 @@ function doconfig() {
 			if [ $? -ne 0 ]; then cfghtwrite=0; fi
 		fi
 
+		if [ $cfghtgwrite -eq 1 ]; then
+			cfghtgroupfile=$(uci -q get access.access.htpath)
+			if [ $? -ne 0 ]; then cfghtgroupfile="/etc/htgroup.map"; fi
+			
+			if [ ! -f $cfghtgroupfile ]; then
+				touch $cfghtgroupfile
+				if [ $? -ne 0 ]; then cfghtgwrite=0; fi
+			fi
+		fi
+
 		doverbose "Htpasswd file: $cfghtpassfile"
+		doverbose "Htgroup map file: $cfghtgroupfile"
 		doverbose "Htpasswd hash method: $cfghthashmethod"
 	fi
 
@@ -309,6 +328,7 @@ function doexportdeletions() {
 				fi
 				if [ $cfgsmbwrite -eq 1 ]; then	sed -i "/^${knownuser}:.*/d" "${cfgsmbpassfile}"; fi
 				if [ $cfghtwrite -eq 1 ]; then sed -i "/^[#]*${knownuser}:.*/d" "${cfghtpassfile}"; fi
+				if [ $cfghtgwrite -eq 1 ]; then sed -i "/^[#]*${knownuser} .*/d" "${cfghtgroupfile}"; fi
 				local syncindex=-1; local syncmode=""; while syncmode=$(uci -q get access.@sync[$((syncindex+1))].mode 2> /dev/null); do syncindex=$((syncindex+1))
 					local syncpath=$(uci -q get access.@sync[$((syncindex))].path 2> /dev/null)
 					if [ "$syncmode" == "passwd" ]; then
@@ -523,14 +543,26 @@ function doexportusers() {
 
 		fi
 
-		# [6/7] Synchronise user htpasswd entry
+		# [6/7] Synchronise user htpasswd (and optionally htgroup.map) entry
 		if [ $cfghtwrite -eq 1 ]; then
 
-			# Establish that a htpasswd line exists if and only if a valid htpasswdhash is set
+			# Establish that a htpasswd (and optionally a htgroup.map) line exists if and only if a valid htpasswdhash is set
 			if [ ! "$userhtpasswdhash" == "" ]; then
+
+				# Synchronise user htpasswd entry
 				local htpasswdlineout=""; if [ $userenabled -eq 0 ]; then htpasswdlineout="#"; fi; htpasswdlineout="${htpasswdlineout}${username}:${userhtpasswdhash}"
 				local htpasswdline=""; if ! htpasswdline=$(cat $cfghtpassfile | grep "^[#]*${username}:") || [ ! "$htpasswdline" == "$htpasswdlineout" ]; then
 					if ! sed -i "/^[#]*${username}:.*/d" "${cfghtpassfile}" > /dev/null 2>&1 || ! echo "$htpasswdlineout" >> $cfghtpassfile; then doerr "Failed to update user $username within htpasswd."; else doverbose "Updated user $username within htpasswd."; fi
+				fi
+
+				# Synchronise user htgroup map entry
+				if [ $cfghtgwrite -eq 1 ]; then
+					local htgrouplineout=""; if [ $userenabled -eq 1 ]; then htgrouplineout="${username} ,${usergroupsraw},;"; fi
+					local htgroupline=""; if ! htgroupline=$(cat $cfghtpassfile | grep "^[#]*${username}:") || [ ! "$htgroupline" == "$htgrouplineout" ]; then
+						if ! sed -i "/^[#]*${username} .*/d" "${cfghtgroupfile}" > /dev/null 2>&1; then doerr "Failed to update user $username within htgroup.map."; fi
+						if [ ! "$htgrouplineout" == "" ] && ! echo "$htgrouplineout" >> $cfghtgroupfile; then doerr "Failed to update user $username within htgroup.map."; fi
+					fi
+
 				fi
 			else
 				if cat $cfghtpassfile | grep "^[#]*${username}:" > /dev/null > /dev/null; then
@@ -547,7 +579,7 @@ function doexportusers() {
 
 			# With given output path and group filter
 			local syncpath=""; if ! syncpath=$(uci -q get access.@sync[$syncindex].path); then doerr "Failed to read sync $syncindex path. Skipping."; continue; fi
-			local syncgroup=""; if ! syncgroup=$(uci -q get access.@sync[$syncindex].group); then doerr "Failed to read sync $syncindex group. Skipping."; continue; fi
+			local syncgroup=""; if ! syncgroup=$(uci -q get access.@sync[$syncindex].group); then syncgroup=""; fi
 
 			# As well as mode differentiating between passwd, smbasswd and htpasswd databases
 			if [ "$syncmode" == "passwd" ]; then
@@ -606,7 +638,20 @@ function doexportusers() {
 					if syncin=$(cat ${syncpath} | grep -e "^[#]*${username}:") && [ ! "$syncin" == "$syncout" ]; then sed -i "/^[#]*${username}:.*/d" "${syncpath}" > /dev/null 2>&1; fi
 					if [ ! "$syncin" == "$syncout" ]; then echo "$syncout" >> "${syncpath}"; dopushexportpost $syncindex; fi
 				fi
-				
+
+			elif [ $cfghtwrite -eq 1 ] && [ "$syncmode" == "htgroupmap" ]; then
+
+				# Remove user if group filter set and unmatched
+				if [ ! "$syncgroup" == "" ] && [[ ! ,${usergroupsraw}, == *,${syncgroup},* ]]; then
+					if [ -f "${syncpath}" ] && cat "${syncpath}" | grep -e "^[#]*${username}:" > /dev/null; then sed -i "/^[#]*${username} .*/d" "${syncpath}" > /dev/null 2>&1; dopushexportpost $syncindex; fi
+				else
+					# Add or update htpasswd entry
+					if [ ! -f "${syncpath}" ]; then touch "${syncpath}"; fi
+					syncout=$(cat $cfghtgroupfile | grep -e "^[#]*${username} ")
+					if syncin=$(cat ${syncpath} | grep -e "^[#]*${username} ") && [ ! "$syncin" == "$syncout" ]; then sed -i "/^[#]*${username} .*/d" "${syncpath}" > /dev/null 2>&1; fi
+					if [ ! "$syncin" == "$syncout" ]; then echo "$syncout" >> "${syncpath}"; dopushexportpost $syncindex; fi
+				fi
+								
 			fi
 
 			# So that external system, smb and ht passwd databases represent all uci users (eligible through their respective group membership)

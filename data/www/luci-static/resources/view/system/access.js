@@ -46,6 +46,11 @@ return view.extend({
 		o.rmempty = false;
 		o.default = 0;
 
+		o = sc.option(form.Flag, 'htg', _('Synchronise uci to htgroup.map'), _('Maintains system user to groups map.'));
+		o.editable = true;
+		o.rmempty = false;
+		o.default = 0;
+
 		o = sc.option(form.Value, 'hthashmethod', _('Hash method for htpasswd'));
 		o.editable = true;
 		o.rmempty = false;
@@ -86,6 +91,7 @@ return view.extend({
 			o.value('smbpasswd', 'Samba passwd');
 			o.value('htpasswd', 'Hypertext passwd');
 			o.value('htpasswdgrp', 'Hypertext passwd with groups');
+			o.value('htgroupmap', 'Hypertext user/groups map');
 			o.default = 'passwd';
 
 			o = s.option(form.Value, 'path', _('Export Path'));
